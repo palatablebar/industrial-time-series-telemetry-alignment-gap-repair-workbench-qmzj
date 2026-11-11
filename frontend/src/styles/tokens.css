@@ -1,0 +1,28 @@
+/* TSALIGN design tokens — 天文台观测记录 / 星历日志
+   warm paper, ink green, ochre; Spectral + IBM Plex Mono */
+:root {
+  --paper: oklch(0.965 0.018 85);
+  --paper-2: oklch(0.938 0.024 82);
+  --paper-3: oklch(0.905 0.028 78);
+  --ink: oklch(0.285 0.032 165);
+  --ink-green: oklch(0.34 0.05 160);
+  --ink-soft: oklch(0.475 0.028 160);
+  --ink-faint: oklch(0.62 0.02 150);
+  --ochre: oklch(0.56 0.12 55);
+  --ochre-deep: oklch(0.455 0.125 48);
+  --ochre-soft: oklch(0.78 0.07 62);
+  --rule: oklch(0.82 0.02 85);
+  --rule-strong: oklch(0.67 0.028 80);
+  --alert: oklch(0.52 0.15 32);
+  --ok: oklch(0.44 0.085 155);
+  --font-serif: 'Spectral', 'Noto Serif SC', Georgia, 'Songti SC', serif;
+  --font-mono: 'IBM Plex Mono', 'SFMono-Regular', Menlo, monospace;
+  --rail: 92px;
+  --gutter: clamp(20px, 3vw, 44px);
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --fs-display: clamp(30px, 3.4vw, 52px);
+  --fs-title: clamp(20px, 1.8vw, 27px);
+  --fs-body: 13.5px;
+  --fs-small: 11.5px;
+  --fs-micro: 10px;
+}

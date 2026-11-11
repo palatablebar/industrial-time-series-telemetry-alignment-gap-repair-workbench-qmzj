@@ -1,0 +1,5 @@
+"""Human-facing copy that multiple services reuse."""
+CUSTOMER = "瀚川重工 · 设备可靠性组"
+PLATFORM_NAME = "TSALIGN"
+PLATFORM_SUBTITLE = "工业时序遥测对齐与缺口修复工作台"
+DEMO_PASSWORD = "Demo@2026"
