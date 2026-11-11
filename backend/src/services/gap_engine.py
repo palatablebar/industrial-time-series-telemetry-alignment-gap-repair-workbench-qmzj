@@ -1,15 +1,17 @@
 """B. 缺口填补、置信度与质量评分引擎（真算）。
 
-输入：对齐序列（每信号桶值 + 非空标记）。
-步骤：
-  1. 连续空桶（长度 ≥ 2 桶）识别为缺口事件；
+输入：对齐通道序列（统一网格桶值 + 观测掩码 + 逐桶来源 provenance）。
+口径要点（本版修订）：
+  1. 连续未观测桶（长度 ≥ 2 桶）识别为缺口事件——只有真实回传能点亮观测掩码，
+     网关掉线形成的空档不会被任何填补值当成观测；
   2. 按 job 的填补策略 locf / linear / seasonal_naive 填补
-     （seasonal_naive 周期 = 24h 网格数，窗口不足一周回退 locf）；
+     （seasonal_naive 周期 = 24h 网格数，窗口不足回退 locf），填补值仅作展示，
+     输出里逐桶标注 observed / gap_filled / source；
   3. 缺口置信度 = exp(-len/τ) × min(1, 邻域方差比)，τ = 10 桶；
   4. 异常率 = 对齐后 |稳健 z| > 3 的比例（z 用窗口稳健中位数 / MAD）；
   5. 质量分（口径固定）：
        score = 100 × (0.5×coverage + 0.3×(1-异常率) + 0.2×drift_score)
-       drift_score = exp(-max|drift_ms| / 1000)
+       drift_score = exp(-max|drift_ms|/1000)
 
 失败态：对齐窗口内没有任何观测 → ``no_data``（不评分）。
 """
@@ -97,7 +99,7 @@ def analyze(
     """Return gaps, filled series, coverage/anomaly/quality components."""
     grid_s = int(aligned["grid_s"])
     t0 = float(aligned["t0"])
-    signals: list[dict] = aligned["signals"]
+    channels: list[dict] = aligned.get("channels") or []
     total_observed = 0
     total_buckets = 0
     total_flags = 0
@@ -105,9 +107,14 @@ def analyze(
     gap_payload: list[dict] = []
     series_payload: list[dict] = []
 
-    for signal in signals:
+    for signal_index, signal in enumerate(channels):
+        # raw_values hold only real observations (NaN where no gateway reported);
+        # values may already carry display-only linear interpolation
+        raw_source = signal.get("raw_values")
+        if raw_source is None:
+            raw_source = signal.get("values") or []
         raw_values = np.asarray(
-            [np.nan if value is None else float(value) for value in signal["values"]],
+            [np.nan if value is None else float(value) for value in raw_source],
             dtype=float,
         )
         observed = np.asarray(signal["observed"], dtype=bool)
@@ -120,6 +127,13 @@ def analyze(
         fallback = float(np.nanmean(observed_values)) if observed_values.size else 0.0
         global_std = float(np.std(observed_values)) if observed_values.size >= 2 else 0.0
         filled = raw_values.copy()
+        gap_filled = np.zeros(bucket_count, dtype=bool)
+        provenance = list(signal.get("provenance") or [""] * bucket_count)
+        contributors = [list(item) for item in (signal.get("contributors") or [])]
+        if len(provenance) < bucket_count:
+            provenance += [""] * (bucket_count - len(provenance))
+        if len(contributors) < bucket_count:
+            contributors += [[] for _ in range(bucket_count - len(contributors))]
         index = 0
         while index < bucket_count:
             if observed[index]:
@@ -132,6 +146,7 @@ def analyze(
             if length >= 2:
                 fill_values = _fill_gap(raw_values, index, end, grid_s, fill_strategy, fallback)
                 filled[index:end] = fill_values
+                gap_filled[index:end] = True
                 duration_s = round(length * grid_s, 3)
                 confidence = _gap_confidence(raw_values, observed, index, end, global_std)
                 signal_start = float(signal.get("start_ts") or t0)
@@ -139,11 +154,13 @@ def analyze(
                 end_ts = signal_start + end * grid_s
                 gap_payload.append(
                     {
-                        "signal_index": len(series_payload),
+                        "signal_index": signal_index,
                         "signal_code": signal["signal_code"],
                         "device_code": signal["device_code"],
                         "measure_name": signal["measure_name"],
                         "unit": signal["unit"],
+                        "source_code": signal.get("source_code", ""),
+                        "source_codes": signal.get("source_codes") or [signal.get("source_code", "")],
                         "start_ts": start_ts,
                         "end_ts": end_ts,
                         "start_bucket": index,
@@ -156,24 +173,35 @@ def analyze(
                 )
             index = end
 
+        # filled buckets never carry an observing source: provenance explicitly blanks
+        for slot in range(bucket_count):
+            if gap_filled[slot]:
+                provenance[slot] = ""
+                contributors[slot] = []
+
         flags, scored = anomaly_flags(filled)
         total_flags += flags
         total_scored += scored
         series_payload.append(
             {
-                "signal_index": len(series_payload),
+                "signal_index": signal_index,
                 "signal_code": signal["signal_code"],
                 "device_code": signal["device_code"],
                 "device_name": signal.get("device_name", ""),
                 "measure_name": signal["measure_name"],
                 "unit": signal["unit"],
-                "source_code": signal["source_code"],
+                "source_code": signal.get("source_code", ""),
+                "source_codes": signal.get("source_codes") or [signal.get("source_code", "")],
+                "member_signal_codes": signal.get("member_signal_codes") or [signal["signal_code"]],
                 "bucket_count": bucket_count,
                 "start_ts": float(signal.get("start_ts") or t0),
                 "observed_count": int(observed.sum()),
                 "coverage": signal.get("coverage", 0.0),
                 "values": [None if math.isnan(v) else round(float(v), 4) for v in filled],
                 "observed": observed.tolist(),
+                "gap_filled": gap_filled.tolist(),
+                "provenance": provenance,
+                "contributors": contributors,
             }
         )
 

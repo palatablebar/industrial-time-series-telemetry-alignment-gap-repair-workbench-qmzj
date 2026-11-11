@@ -53,7 +53,7 @@
                   @click="activeIndex = index"
                 >
                   <span class="mono">{{ item.signal_code }}</span>
-                  <span class="signal-tab__meta">{{ item.measure_name }}</span>
+                  <span class="signal-tab__meta">{{ item.measure_name }} · {{ (item.source_codes ?? [item.source_code]).join('/') }}</span>
                 </button>
               </div>
               <WaveformChart :series-list="run.series" :gaps="run.gaps" :active-index="activeIndex" :grid-s="run.grid_s" mode="wave" />
@@ -68,6 +68,7 @@
                 <thead>
                   <tr>
                     <th>测点</th>
+                    <th>来源</th>
                     <th>起</th>
                     <th>止</th>
                     <th>时长</th>
@@ -79,6 +80,7 @@
                 <tbody>
                   <tr v-for="gap in run.gaps" :key="gap.id">
                     <td>{{ gap.signal_code }}</td>
+                    <td class="cell-source">{{ (gap.source_codes && gap.source_codes.length ? gap.source_codes : [gap.source_code ?? '—']).join(' / ') }}</td>
                     <td>{{ formatDateTime(gap.start_ts) }}</td>
                     <td>{{ formatDateTime(gap.end_ts) }}</td>
                     <td>{{ gap.duration_s.toFixed(0) }}s</td>
@@ -87,10 +89,11 @@
                     <td><SeverityBadge :severity="gap.severity" /></td>
                   </tr>
                   <tr v-if="run.gaps.length === 0">
-                    <td colspan="7" class="empty-cell">该窗口没有连续空桶（≥2 桶），无缺口事件。</td>
+                    <td colspan="8" class="empty-cell">该窗口没有连续空桶（≥2 桶），无缺口事件。</td>
                   </tr>
                 </tbody>
               </table>
+              <p class="table-footnote mono">缺口来自网关真实未观测桶；填补值仅用于展示与下游分析，导出 CSV 中 gap_filled=1 的行 provenance_source 留空、observed=0，不会被当成真实观测。</p>
             </div>
           </section>
 
@@ -103,20 +106,58 @@
             />
 
             <div class="panel">
-              <div class="panel__title"><h2>漂移估计</h2><span class="mono panel-note">drift table</span></div>
+              <div class="panel__title"><h2>漂移估计与时钟校正</h2><span class="mono panel-note">drift & correction ledger</span></div>
               <table class="table table--mono">
                 <thead>
-                  <tr><th>源</th><th>drift</th><th>conf</th></tr>
+                  <tr><th>源</th><th>时钟偏差</th><th>校正量</th><th>置信度</th><th>角色</th></tr>
                 </thead>
                 <tbody>
                   <tr v-for="item in run.drift" :key="item.source_id">
                     <td>{{ item.source_code }}</td>
-                    <td>{{ item.drift_ms > 0 ? '+' : '' }}{{ item.drift_ms.toFixed(0) }}ms</td>
+                    <td :class="{ 'cell-muted': item.is_estimated === false }">
+                      {{ item.is_estimated === false ? '无法估计' : `${item.drift_ms > 0 ? '+' : ''}${item.drift_ms.toFixed(0)}ms` }}
+                    </td>
+                    <td>{{ item.is_estimated === false ? '—' : `${(item.correction_ms ?? -item.drift_ms) > 0 ? '+' : ''}${(item.correction_ms ?? -item.drift_ms).toFixed(0)}ms` }}</td>
                     <td>{{ (item.confidence * 100).toFixed(0) }}%</td>
+                    <td>
+                      <span v-if="item.is_anchor" class="role-tag role-tag--anchor">时钟锚点</span>
+                      <span v-else class="role-tag">回传源</span>
+                    </td>
                   </tr>
                 </tbody>
               </table>
-              <p class="aside-note">漂移按同设备跨网关测点互相关估计，正号表示该源时间戳整体晚于参考源。</p>
+              <p class="aside-note">
+                校正先于分箱执行：校正后时间戳 = 原始时间戳 − 时钟偏差。正偏差表示该源时间戳整体晚于锚点源；
+                无同测点冗余证据的源标记「无法估计」，不做臆测校正。
+              </p>
+              <div v-if="run.corrections?.length" class="correction-note mono">
+                <span v-for="c in run.corrections" :key="c.source_id" class="correction-chip">
+                  {{ c.source_code }}: {{ c.is_anchor ? '锚点不校正' : `应用 ${c.correction_ms > 0 ? '+' : ''}${c.correction_ms.toFixed(0)}ms` }}
+                </span>
+              </div>
+            </div>
+
+            <div v-if="activeOverlap" class="panel">
+              <div class="panel__title">
+                <h2>重叠来源采用</h2>
+                <span class="mono panel-note">{{ activeOverlap.overlap_buckets }} 重叠桶</span>
+              </div>
+              <table class="table table--mono">
+                <thead>
+                  <tr><th>来源网关</th><th>覆盖桶</th><th>被采用桶</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="stat in activeOverlap.source_buckets" :key="stat.source_code">
+                    <td>{{ stat.source_code }}</td>
+                    <td>{{ stat.buckets }}</td>
+                    <td>{{ stat.selected_buckets }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p class="aside-note">
+                同一设备、同一物理量的多路回传在同一 5s 桶重叠时，优先采用时钟偏差绝对值最小的源；
+                全部贡献源保留在桶级 contributors，可在导出 CSV 逐桶回看。
+              </p>
             </div>
 
             <FormulaCard class="panel" :text="run.components.formula" />
@@ -169,6 +210,17 @@ const activeIndex = ref(0)
 const exportMessage = ref('')
 
 const run = computed(() => store.detail)
+
+const activeSeries = computed(() => run.value?.series[activeIndex.value])
+const activeOverlap = computed(() => {
+  const current = activeSeries.value
+  if (!current || !run.value?.overlaps?.length) return null
+  return run.value.overlaps.find(
+    (ledger) =>
+      ledger.signal_code === current.signal_code ||
+      (current.member_signal_codes ?? []).includes(ledger.signal_code),
+  ) ?? null
+})
 
 async function load() {
   const runId = Number(route.params.id)
@@ -246,6 +298,44 @@ onMounted(load)
   color: var(--ink-faint);
   margin: 8px 0 0;
   line-height: 1.7;
+}
+.cell-muted {
+  color: var(--ink-faint);
+}
+.cell-source {
+  font-size: 10px;
+  color: var(--ink-soft);
+}
+.table-footnote {
+  margin: 10px 0 0;
+  font-size: 9.5px;
+  color: var(--ink-faint);
+  line-height: 1.7;
+}
+.role-tag {
+  font-size: 9.5px;
+  padding: 2px 7px;
+  border: 1px solid var(--rule-strong);
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.role-tag--anchor {
+  border-color: var(--ink-green);
+  color: var(--ink-green);
+  background: oklch(0.975 0.02 150 / 0.5);
+}
+.correction-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.correction-chip {
+  font-size: 9.5px;
+  padding: 3px 8px;
+  background: oklch(0.985 0.012 88);
+  border: 1px solid var(--rule);
+  color: var(--ink-soft);
 }
 .ledger {
   margin: 0;

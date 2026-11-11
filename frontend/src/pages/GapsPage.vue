@@ -41,6 +41,7 @@
           <tr>
             <th>运行</th>
             <th>测点</th>
+            <th>来源</th>
             <th>起</th>
             <th>止</th>
             <th>时长</th>
@@ -55,6 +56,7 @@
           <tr v-for="gap in store.items" :key="gap.id">
             <td>{{ gap.run_name || `#${gap.run_id}` }}</td>
             <td>{{ gap.signal_code }}</td>
+            <td class="cell-source">{{ gap.source_code ?? '—' }}</td>
             <td>{{ formatDateTime(gap.start_ts) }}</td>
             <td>{{ formatDateTime(gap.end_ts) }}</td>
             <td>{{ gap.duration_s.toFixed(0) }}s</td>
@@ -77,7 +79,7 @@
             </td>
           </tr>
           <tr v-if="store.items.length === 0">
-            <td colspan="10" class="empty-cell">当前筛选条件下没有缺口事件。</td>
+            <td colspan="11" class="empty-cell">当前筛选条件下没有缺口事件。</td>
           </tr>
         </tbody>
       </table>
@@ -207,6 +209,10 @@ onMounted(async () => {
 .empty-cell {
   color: var(--ink-faint);
   font-family: var(--font-serif);
+}
+.cell-source {
+  font-size: 10px;
+  color: var(--ink-soft);
 }
 .annotate {
   display: flex;

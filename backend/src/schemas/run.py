@@ -6,6 +6,10 @@ class DriftItem(BaseModel):
     source_code: str
     drift_ms: float
     confidence: float
+    is_anchor: bool = False
+    is_estimated: bool = True
+    correction_ms: float = 0.0
+    evidence: list[dict] = []
 
 
 class SeriesItem(BaseModel):
@@ -15,11 +19,17 @@ class SeriesItem(BaseModel):
     measure_name: str
     unit: str
     source_code: str
+    source_codes: list[str] = []
+    member_signal_codes: list[str] = []
     bucket_count: int
     observed_count: int
     coverage: float
+    start_ts: float
     values: list[float | None]
     observed: list[bool]
+    gap_filled: list[bool] = []
+    provenance: list[str] = []
+    contributors: list[list[str]] = []
 
 
 class GapOut(BaseModel):
@@ -67,6 +77,8 @@ class RunDetail(RunOut):
     agg_strategy: str
     fill_strategy: str
     drift: list[DriftItem]
+    corrections: list[dict] = []
+    overlaps: list[dict] = []
     series: list[SeriesItem]
     gaps: list[GapOut]
     components: dict

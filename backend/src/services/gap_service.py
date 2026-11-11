@@ -18,6 +18,7 @@ def _to_dict(gap: GapEvent, run: AlignmentRun | None) -> dict:
         "device_name": signal.device_name if signal else "",
         "measure_name": signal.measure_name if signal else "",
         "unit": signal.unit if signal else "",
+        "source_code": (signal.source.code if signal and signal.source else ""),
         "start_ts": iso(gap.start_ts),
         "end_ts": iso(gap.end_ts),
         "duration_s": gap.duration_s,

@@ -7,6 +7,7 @@ export interface GapEvent {
   device_name: string
   measure_name: string
   unit: string
+  source_code?: string
   start_ts: string
   end_ts: string
   duration_s: number

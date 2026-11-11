@@ -52,22 +52,26 @@
 
           <div class="panel">
             <div class="panel__title">
-              <h2>漂移估计台账</h2>
-              <span class="mono panel-note">最近 8 次完成运行</span>
+              <h2>漂移估计与校正台账</h2>
+              <span class="mono panel-note">最近 8 次完成运行 · 校正先于分箱</span>
             </div>
             <table class="table table--mono">
               <thead>
-                <tr><th>运行</th><th>来源</th><th>drift</th><th>置信度</th></tr>
+                <tr><th>运行</th><th>来源</th><th>时钟偏差</th><th>校正量</th><th>置信度</th><th>角色</th></tr>
               </thead>
               <tbody>
                 <tr v-for="(row, index) in summary.drift_table" :key="`${row.run_id}-${row.source_code}-${index}`">
                   <td>#{{ row.run_id }} {{ row.job_name }}</td>
                   <td>{{ row.source_code }}</td>
-                  <td>{{ Number(row.drift_ms) > 0 ? '+' : '' }}{{ Number(row.drift_ms).toFixed(1) }}ms</td>
+                  <td :class="{ 'cell-muted': row.is_estimated === false }">
+                    {{ row.is_estimated === false ? '无法估计' : `${Number(row.drift_ms) > 0 ? '+' : ''}${Number(row.drift_ms).toFixed(1)}ms` }}
+                  </td>
+                  <td>{{ row.is_estimated === false ? '—' : `${Number(row.correction_ms) > 0 ? '+' : ''}${Number(row.correction_ms).toFixed(1)}ms` }}</td>
                   <td>{{ (Number(row.confidence) * 100).toFixed(0) }}%</td>
+                  <td>{{ row.is_anchor ? '锚点' : '回传源' }}</td>
                 </tr>
                 <tr v-if="summary.drift_table.length === 0">
-                  <td colspan="4" class="empty-line">暂无漂移估计记录。</td>
+                  <td colspan="6" class="empty-line">暂无漂移估计记录。</td>
                 </tr>
               </tbody>
             </table>
@@ -337,5 +341,8 @@ onMounted(() => store.load())
 .loading {
   color: var(--ink-faint);
   font-size: 11.5px;
+}
+.cell-muted {
+  color: var(--ink-faint);
 }
 </style>

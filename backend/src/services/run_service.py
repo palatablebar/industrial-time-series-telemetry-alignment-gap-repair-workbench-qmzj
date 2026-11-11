@@ -16,6 +16,9 @@ EXPORT_HEADER = [
     "device_code",
     "measure_name",
     "source_code",
+    "source_codes",
+    "provenance_source",
+    "contributors",
     "unit",
     "timestamp",
     "value",
@@ -82,6 +85,7 @@ def to_detail(db: Session, run: AlignmentRun) -> dict:
                 "signal_code": signal.code if signal else "",
                 "device_code": signal.device_code if signal else "",
                 "measure_name": signal.measure_name if signal else "",
+                "source_code": (signal.source.code if signal and signal.source else ""),
                 "start_ts": iso(gap.start_ts),
                 "end_ts": iso(gap.end_ts),
                 "duration_s": gap.duration_s,
@@ -104,6 +108,8 @@ def to_detail(db: Session, run: AlignmentRun) -> dict:
             "agg_strategy": job.agg_strategy if job else "",
             "fill_strategy": job.fill_strategy if job else "",
             "drift": result.get("drift") or [],
+            "corrections": result.get("corrections") or [],
+            "overlaps": result.get("overlaps") or [],
             "series": result.get("series") or [],
             "gaps": gap_payload,
             "components": result.get("components") or {},
@@ -114,6 +120,8 @@ def to_detail(db: Session, run: AlignmentRun) -> dict:
                     "measure_name": item.get("measure_name"),
                     "unit": item.get("unit"),
                     "source_code": item.get("source_code"),
+                    "source_codes": item.get("source_codes") or [item.get("source_code")],
+                    "member_signal_codes": item.get("member_signal_codes") or [item.get("signal_code")],
                     "bucket_count": item.get("bucket_count"),
                     "observed_count": item.get("observed_count"),
                     "coverage": item.get("coverage"),
@@ -138,21 +146,33 @@ def export_csv(db: Session, run_id: int) -> tuple[str, str, int]:
     for series in result.get("series") or []:
         values = series.get("values") or []
         observed = series.get("observed") or []
+        gap_filled = series.get("gap_filled") or []
+        provenance = series.get("provenance") or []
+        contributors = series.get("contributors") or []
+        source_codes = series.get("source_codes") or [series.get("source_code", "")]
         for index, value in enumerate(values):
             is_observed = bool(observed[index]) if index < len(observed) else False
+            is_filled = bool(gap_filled[index]) if index < len(gap_filled) else not is_observed
             series_start = float(series.get("start_ts") or result.get("t0") or 0.0)
             timestamp = iso(from_epoch(series_start + index * grid_s)) if series_start else ""
+            provenance_source = provenance[index] if index < len(provenance) else ""
+            if not provenance_source and is_observed:
+                provenance_source = series.get("source_code", "")
+            bucket_contributors = contributors[index] if index < len(contributors) else []
             writer.writerow(
                 [
                     series.get("signal_code", ""),
                     series.get("device_code", ""),
                     series.get("measure_name", ""),
                     series.get("source_code", ""),
+                    "|".join(code for code in source_codes if code),
+                    provenance_source,
+                    "|".join(code for code in bucket_contributors if code),
                     series.get("unit", ""),
                     timestamp,
                     "" if value is None else value,
                     "1" if is_observed else "0",
-                    "0" if is_observed else "1",
+                    "1" if is_filled else "0",
                 ]
             )
             row_count += 1

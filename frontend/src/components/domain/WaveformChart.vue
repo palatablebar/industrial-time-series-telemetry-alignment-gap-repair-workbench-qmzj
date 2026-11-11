@@ -10,8 +10,19 @@
       </div>
       <div class="waveform__legend">
         <span class="waveform__key waveform__key--line">对齐值</span>
+        <span
+          v-for="(code, index) in sourceLegend"
+          :key="code"
+          class="waveform__key"
+        >
+          <span class="waveform__dot" :style="{ background: sourcePalette[index % sourcePalette.length] }"></span>{{ code }}
+        </span>
         <span class="waveform__key waveform__key--gap">缺口区间</span>
+        <span class="waveform__key waveform__key--filled">填补值</span>
       </div>
+    </div>
+    <div v-if="mode === 'wave' && series?.source_codes && series.source_codes.length > 1" class="waveform__provenance mono">
+      冗余通道：{{ series.member_signal_codes?.join(' / ') }} · 重叠桶按校正量最小源采用，逐桶来源见导出 CSV
     </div>
     <div v-if="mode === 'wave'" class="waveform__canvas-wrap">
       <canvas ref="canvasRef"></canvas>
@@ -43,6 +54,7 @@
       <span class="mono">grid {{ gridS }}s</span>
       <span class="mono">buckets {{ series?.bucket_count ?? 0 }}</span>
       <span class="mono">observed {{ series?.observed_count ?? 0 }}</span>
+      <span class="mono">filled {{ filledCount }}</span>
       <span class="mono">coverage {{ series ? (series.coverage * 100).toFixed(2) : '—' }}%</span>
     </div>
   </div>
@@ -70,6 +82,26 @@ const size = ref({ width: 760, height: 300 })
 const { animate } = useWaveform()
 
 const series = computed<SeriesItem | undefined>(() => props.seriesList[props.activeIndex] ?? props.seriesList[0])
+
+const sourcePalette = [
+  'oklch(0.42 0.08 160)',
+  'oklch(0.55 0.13 55)',
+  'oklch(0.45 0.11 275)',
+  'oklch(0.5 0.12 25)',
+  'oklch(0.4 0.1 210)',
+]
+
+const sourceLegend = computed<string[]>(() => {
+  const codes = new Set<string>()
+  for (const item of props.seriesList) {
+    for (const code of item.provenance ?? []) {
+      if (code) codes.add(code)
+    }
+  }
+  return Array.from(codes)
+})
+
+const filledCount = computed<number>(() => (series.value?.gap_filled ?? []).filter(Boolean).length)
 
 function gapsFor(signalCode: string): RunGap[] {
   return props.gaps.filter((gap) => gap.signal_code === signalCode)
@@ -105,6 +137,7 @@ function redraw() {
     gaps: gapsFor(series.value.signal_code),
     width,
     height,
+    gridS: props.gridS ?? 5,
   })
 }
 
@@ -175,6 +208,26 @@ defineExpose({ redraw, emit })
 .waveform__key--gap::before {
   background: var(--ochre-soft);
   height: 8px;
+}
+.waveform__key--filled::before {
+  height: 0;
+  width: 16px;
+  border-top: 2px dashed oklch(0.6 0.13 50);
+  background: transparent;
+}
+.waveform__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.waveform__provenance {
+  padding-top: 8px;
+  font-size: 10px;
+  color: var(--ink-faint);
+  line-height: 1.6;
 }
 .waveform__canvas-wrap {
   position: relative;

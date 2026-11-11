@@ -30,7 +30,10 @@ def summary(db: Session, user: User, daily_limit: int) -> dict:
                     "job_name": run.job.name if run.job else "",
                     "source_code": item.get("source_code", ""),
                     "drift_ms": item.get("drift_ms", 0),
+                    "correction_ms": item.get("correction_ms", -float(item.get("drift_ms", 0) or 0.0)),
                     "confidence": item.get("confidence", 0),
+                    "is_anchor": item.get("is_anchor", False),
+                    "is_estimated": item.get("is_estimated", True),
                 }
             )
     trend = [

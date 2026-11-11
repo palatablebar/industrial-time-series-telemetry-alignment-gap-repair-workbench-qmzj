@@ -1,14 +1,22 @@
 """A. 时间对齐与重采样引擎（真算，无第三方时序库依赖）。
 
-输入：多源不规则时间戳原始点 ``(ts_epoch, value, seq)``。
-步骤：
-  1. 排序并按时间戳去重（同 ts 保留 last，即 seq 最大者）；
-  2. 以全局最早点为原点分箱 ``bucket = floor((ts - t0) / grid)``；
-  3. 桶内聚合 mean / last / linear（linear 先取桶均值，再对空桶线性插值）；
-  4. 时钟漂移：对同一设备在不同源上的测点两两做互相关，±60s 内 250ms 步长
-     粗扫、峰值附近 5ms 细化，重叠率不足 75% 的 lag 不计分；
-     多对估计按相关系数加权，最后以参考源为锚做一致性校正；
-  5. 覆盖率 = 全部信号的非空桶 / 全部信号的总桶（按各信号有效采集跨度裁剪）。
+夜间离线合并口径（本版修订，替代旧的「各信号从自己的起点分箱」）：
+
+输入：多网关回传的不规则时间戳原始点 ``(ts_epoch, value, seq)``，每个信号带
+``device_code / measure_name / source_id``。处理顺序固定为：
+
+  1. 窗口过滤、按时间戳排序去重（同 ts 保留 seq 最大者）、乱序率检查；
+  2. 时钟漂移估计：同一设备、同一物理量（measure_name 相同）被多个网关冗余
+     采集的信号两两互相关，±60s 内 250ms 粗扫、峰值附近 5ms 细化，重叠率
+     不足 75% 的 lag 不计分；按相关系数高次幂加权得到每源 ``drift_ms``；
+  3. 时钟校正：以漂移绝对值最小的源为锚，``校正后 ts = 原始 ts - drift``，
+     每个源的校正量随结果一并落库，可回看；
+  4. 统一观测网格：网格原点对齐到墙上时钟的整 ``grid_s`` 边界，所有通道共用
+     同一张网格 ``bucket = floor((校正后 ts - t0) / grid_s)``，跨设备可比；
+  5. 通道合并：按 (设备, 物理量) 归并多网关成员，桶内按策略聚合；多源重叠桶
+     优先采用校正量绝对值最小的源，逐桶记录采用来源与全部贡献源（overlaps）；
+  6. 观测掩码与展示值分离：linear 的插值只进展示值，观测掩码仍以真实回传为准，
+     网关掉线形成的空档不会被填补值伪装成观测。
 
 失败态：窗口内点数 < 总桶数 10% → ``insufficient_data``；
 时间戳乱序率 > 30% → ``timestamp_disorder``。
@@ -51,9 +59,11 @@ class AlignResult:
     bucket_count: int
     coverage: float
     disorder_rate: float
-    signals: list[dict]
+    channels: list[dict]
     drift: list[dict]
     drift_confidence: float
+    corrections: list[dict]
+    overlaps: list[dict]
     failure: str | None = None
     failure_detail: dict = field(default_factory=dict)
 
@@ -65,9 +75,11 @@ class AlignResult:
             "bucket_count": self.bucket_count,
             "coverage": round(self.coverage, 6),
             "disorder_rate": round(self.disorder_rate, 4),
-            "signals": self.signals,
+            "channels": self.channels,
             "drift": self.drift,
             "drift_confidence": round(self.drift_confidence, 4),
+            "corrections": self.corrections,
+            "overlaps": self.overlaps,
             "failure": self.failure,
             "failure_detail": self.failure_detail,
         }
@@ -96,41 +108,6 @@ def _disorder_rate(points: list[tuple[float, float, int]]) -> float:
         if current[0] < previous[0] - 1e-9:
             inversions += 1
     return inversions / (len(by_seq) - 1)
-
-
-def bucketize(
-    ts: np.ndarray,
-    values: np.ndarray,
-    t0: float,
-    grid_s: int,
-    agg: str,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Return (bucket values with NaN for empty, observed mask, bucket count)."""
-    if ts.size == 0:
-        return np.asarray([]), np.asarray([], dtype=bool), 0
-    bucket_count = int(math.floor((ts[-1] - t0) / grid_s)) + 1
-    bucket_count = max(bucket_count, 1)
-    sums = np.zeros(bucket_count, dtype=float)
-    counts = np.zeros(bucket_count, dtype=int)
-    last_values = np.full(bucket_count, np.nan)
-    indices = np.floor((ts - t0) / grid_s).astype(int)
-    indices = np.clip(indices, 0, bucket_count - 1)
-    for index, value in zip(indices, values):
-        sums[index] += value
-        counts[index] += 1
-        last_values[index] = value
-    aggregated = np.full(bucket_count, np.nan)
-    has_data = counts > 0
-    if agg == AggStrategy.LAST.value:
-        aggregated[has_data] = last_values[has_data]
-    else:
-        aggregated[has_data] = sums[has_data] / counts[has_data]
-    if agg == AggStrategy.LINEAR.value:
-        known = np.where(~np.isnan(aggregated))[0]
-        if known.size >= 2:
-            interpolated = np.interp(np.arange(bucket_count), known, aggregated[known])
-            aggregated = np.where(np.isnan(aggregated), interpolated, aggregated)
-    return aggregated, has_data, bucket_count
 
 
 def _cubic_eval(ts: np.ndarray, values: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -236,61 +213,225 @@ def estimate_pair_drift(
     return refined * 1000.0, max(0.0, peak)
 
 
-def _estimate_source_drift(signals: list[SignalInput]) -> tuple[list[dict], float]:
+def _estimate_source_drift(
+    signals: list[SignalInput],
+) -> tuple[list[dict], dict[int, float], float]:
+    """Estimate per-source clock drift from redundant (same device + same measure) pairs.
+
+    Returns the drift table, a source_id -> drift_ms map, and the max confidence.
+    Only same-physical-quantity pairs are evidence: unlike measures have different
+    response shapes and must not pull the clock estimate.
+    """
     prepared: dict[int, list[tuple[SignalInput, np.ndarray, np.ndarray]]] = {}
     for signal in signals:
         ts, values = _sort_and_dedupe(signal.points)
         if ts.size >= 2:
             prepared.setdefault(signal.source_id, []).append((signal, ts, values))
-    if not prepared:
-        return [], 0.0
     source_ids = sorted(prepared.keys())
+    if not source_ids:
+        return [], {}, 0.0
     reference = source_ids[0]
-    drift: dict[int, float] = {sid: 0.0 for sid in source_ids}
+    raw_drift: dict[int, float] = {sid: 0.0 for sid in source_ids}
     confidence: dict[int, float] = {sid: 0.0 for sid in source_ids}
+    evidence: dict[int, list[dict]] = {sid: [] for sid in source_ids}
+
     for other in source_ids[1:]:
         weighted_sum = 0.0
         weight_total = 0.0
         best_r = 0.0
-        candidates: list[tuple[float, float, float]] = []
         for signal_ref, ts_ref, val_ref in prepared[reference]:
             for signal_other, ts_other, val_other in prepared[other]:
                 if signal_ref.device_code != signal_other.device_code:
                     continue
-                # the same physical measurement is collected redundantly by both
-                # gateways in this plant, so same-name pairs are the primary evidence
-                same_measure = signal_ref.measure_name == signal_other.measure_name
+                if signal_ref.measure_name != signal_other.measure_name:
+                    continue
                 lag_ms, corr = estimate_pair_drift(ts_ref, val_ref, ts_other, val_other)
                 if corr <= 0:
                     continue
-                candidates.append((lag_ms, corr, 1.0 if same_measure else 0.35))
-        if not candidates:
-            continue
-        same_measure_exists = any(item[2] == 1.0 for item in candidates)
-        for lag_ms, corr, kind_weight in candidates:
-            if same_measure_exists and kind_weight < 1.0:
-                continue
-            weight = (corr**6) * kind_weight
-            weighted_sum += lag_ms * weight
-            weight_total += weight
-            best_r = max(best_r, corr)
+                evidence[other].append(
+                    {
+                        "reference_signal": signal_ref.signal_code,
+                        "peer_signal": signal_other.signal_code,
+                        "peer_source": signal_other.source_code,
+                        "lag_ms": round(lag_ms, 1),
+                        "correlation": round(corr, 4),
+                    }
+                )
+                weight = corr**6
+                weighted_sum += lag_ms * weight
+                weight_total += weight
+                best_r = max(best_r, corr)
         if weight_total > 0:
-            drift[other] = weighted_sum / weight_total
+            raw_drift[other] = weighted_sum / weight_total
             confidence[other] = best_r
-    result = [
+
+    # anchor = the reference clock: source_ids[0] is the lowest-id source and acts
+    # as the plant time base (its own drift is defined as zero; other sources are
+    # estimated against it). All corrections are expressed relative to this anchor.
+    anchor = reference
+    anchor_shift = raw_drift[anchor]
+    drift_ms: dict[int, float] = {sid: raw_drift[sid] - anchor_shift for sid in source_ids}
+
+    source_code_by_id = {
+        sid: next(s.source_code for s, _ts, _v in prepared[sid]) for sid in source_ids
+    }
+    table = [
         {
             "source_id": sid,
-            "source_code": next(
-                (s.source_code for s, _ts, _v in prepared[sid]),
-                "",
-            ),
-            "drift_ms": round(drift.get(sid, 0.0), 1),
-            "confidence": round(confidence.get(sid, 0.0), 3),
+            "source_code": source_code_by_id[sid],
+            "drift_ms": round(drift_ms[sid], 1) + 0.0,
+            "confidence": round(confidence[sid], 3),
+            "is_anchor": sid == anchor,
+            "is_estimated": confidence[sid] > 0 or sid == anchor,
+            "correction_ms": round(-(drift_ms[sid]), 1) + 0.0,
+            "evidence": evidence[sid],
         }
         for sid in source_ids
     ]
-    max_conf = max((item["confidence"] for item in result), default=0.0)
-    return result, max_conf
+    max_conf = max((item["confidence"] for item in table), default=0.0)
+    return table, drift_ms, max_conf
+
+
+def _member_buckets(
+    ts: np.ndarray,
+    values: np.ndarray,
+    t0: float,
+    grid_s: int,
+) -> dict[int, dict[str, float]]:
+    """Aggregate one gateway member onto the shared grid: bucket -> sum/count/last."""
+    buckets: dict[int, dict[str, float]] = {}
+    indices = np.floor((ts - t0) / grid_s).astype(int)
+    for index, value in zip(indices, values):
+        entry = buckets.get(int(index))
+        if entry is None:
+            buckets[int(index)] = {"sum": float(value), "count": 1.0, "last": float(value)}
+        else:
+            entry["sum"] += float(value)
+            entry["count"] += 1.0
+            entry["last"] = float(value)
+    return buckets
+
+
+def _build_channel(
+    members: list[tuple[SignalInput, np.ndarray, np.ndarray]],
+    t0: float,
+    grid_s: int,
+    agg: str,
+    drift_by_source: dict[int, float],
+) -> tuple[dict, dict]:
+    """Merge redundant gateway members of one (device, measure) channel on the grid."""
+    per_member: list[dict] = []
+    bucket_lo = math.inf
+    bucket_hi = -math.inf
+    for signal, ts, values in members:
+        member_buckets = _member_buckets(ts, values, t0, grid_s)
+        if member_buckets:
+            bucket_lo = min(bucket_lo, min(member_buckets))
+            bucket_hi = max(bucket_hi, max(member_buckets))
+        per_member.append({"signal": signal, "buckets": member_buckets})
+
+    length = int(bucket_hi - bucket_lo) + 1
+    raw_values = np.full(length, np.nan)
+    observed = np.zeros(length, dtype=bool)
+    provenance: list[str] = ["" for _ in range(length)]
+    contributors: list[list[str]] = [[] for _ in range(length)]
+    source_bucket_counts: dict[str, int] = {}
+    source_selected_counts: dict[str, int] = {}
+    overlap_events: list[dict] = []
+
+    for slot in range(length):
+        bucket = bucket_lo + slot
+        candidates: list[tuple[float, int, str, dict, SignalInput]] = []
+        present_sources: list[str] = []
+        for item in per_member:
+            entry = item["buckets"].get(bucket)
+            if entry is None:
+                continue
+            signal = item["signal"]
+            candidates.append(
+                (
+                    abs(drift_by_source.get(signal.source_id, 0.0)),
+                    signal.source_id,
+                    signal.source_code,
+                    entry,
+                    signal,
+                )
+            )
+            present_sources.append(signal.source_code)
+            source_bucket_counts[signal.source_code] = source_bucket_counts.get(signal.source_code, 0) + 1
+        if not candidates:
+            continue
+        observed[slot] = True
+        contributors[slot] = present_sources
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        _preference, _sid, chosen_source, entry, chosen_signal = candidates[0]
+        if agg == AggStrategy.LAST.value:
+            raw_values[slot] = entry["last"]
+        else:
+            raw_values[slot] = entry["sum"] / entry["count"]
+        provenance[slot] = chosen_source
+        source_selected_counts[chosen_source] = source_selected_counts.get(chosen_source, 0) + 1
+        if len(present_sources) >= 2:
+            overlap_events.append(
+                {
+                    "bucket": int(bucket),
+                    "start_ts": round(t0 + bucket * grid_s, 3),
+                    "end_ts": round(t0 + (bucket + 1) * grid_s, 3),
+                    "sources": present_sources,
+                    "selected_source": chosen_source,
+                    "selected_signal": chosen_signal.signal_code,
+                }
+            )
+
+    display_values = raw_values.copy()
+    if agg == AggStrategy.LINEAR.value:
+        known = np.where(~np.isnan(display_values))[0]
+        if known.size >= 2:
+            interpolated = np.interp(np.arange(length), known, display_values[known])
+            display_values = np.where(np.isnan(display_values), interpolated, display_values)
+
+    anchor = min(
+        (item["signal"] for item in per_member),
+        key=lambda s: (abs(drift_by_source.get(s.source_id, 0.0)), s.source_id),
+    )
+    start_ts = t0 + bucket_lo * grid_s
+    payload = {
+        "signal_id": anchor.signal_id,
+        "signal_code": anchor.signal_code,
+        "device_code": anchor.device_code,
+        "device_name": anchor.device_name,
+        "measure_name": anchor.measure_name,
+        "unit": anchor.unit,
+        "source_id": anchor.source_id,
+        "source_code": anchor.source_code,
+        "member_signal_ids": [item["signal"].signal_id for item in per_member],
+        "member_signal_codes": [item["signal"].signal_code for item in per_member],
+        "source_codes": sorted({item["signal"].source_code for item in per_member}),
+        "start_ts": round(start_ts, 3),
+        "first_ts": round(start_ts, 3),
+        "last_ts": round(t0 + bucket_hi * grid_s, 3),
+        "point_count": int(sum(len(item["signal"].points) for item in per_member)),
+        "bucket_count": length,
+        "coverage": round(float(observed.sum()) / length, 6) if length else 0.0,
+        "values": [None if math.isnan(v) else round(float(v), 4) for v in display_values],
+        "raw_values": [None if math.isnan(v) else round(float(v), 4) for v in raw_values],
+        "observed": observed.tolist(),
+        "provenance": provenance,
+        "contributors": contributors,
+    }
+    overlap_payload = {
+        "signal_code": anchor.signal_code,
+        "device_code": anchor.device_code,
+        "measure_name": anchor.measure_name,
+        "overlap_buckets": len(overlap_events),
+        "source_buckets": [
+            {"source_code": code, "buckets": source_bucket_counts.get(code, 0),
+             "selected_buckets": source_selected_counts.get(code, 0)}
+            for code in sorted(source_bucket_counts)
+        ],
+        "events": overlap_events,
+    }
+    return payload, overlap_payload
 
 
 def align_job(
@@ -326,13 +467,7 @@ def align_job(
     total_points = sum(len(item.points) for item in filtered)
     disorder_rate = float(np.mean(disorder_values)) if disorder_values else 0.0
 
-    prepared = []
-    for signal in filtered:
-        ts, values = _sort_and_dedupe(signal.points)
-        prepared.append((signal, ts, values))
-    all_ts = np.concatenate([ts for _s, ts, _v in prepared]) if prepared else np.asarray([])
-
-    if all_ts.size == 0:
+    if total_points == 0:
         return AlignResult(
             grid_s=grid_s,
             t0=0.0,
@@ -340,9 +475,11 @@ def align_job(
             bucket_count=0,
             coverage=0.0,
             disorder_rate=disorder_rate,
-            signals=[],
+            channels=[],
             drift=[],
             drift_confidence=0.0,
+            corrections=[],
+            overlaps=[],
             failure=FailureReason.INSUFFICIENT_DATA.value,
             failure_detail={
                 "reason": "窗口内没有任何原始点，无法建立对齐网格",
@@ -350,40 +487,57 @@ def align_job(
             },
         )
 
-    t0 = float(np.min(all_ts))
-    total_buckets = 0
-    observed_buckets = 0
-    signal_payloads: list[dict] = []
-    for signal, ts, values in prepared:
-        # each signal is bucketed from its own first sample, so an offset capture
-        # start does not masquerade as leading empty buckets (gaps stay real dropouts)
-        signal_t0 = float(ts[0])
-        bucket_values, observed, bucket_count = bucketize(ts, values, signal_t0, grid_s, agg)
-        total_buckets += bucket_count
-        observed_buckets += int(observed.sum())
-        signal_payloads.append(
-            {
-                "signal_id": signal.signal_id,
-                "signal_code": signal.signal_code,
-                "device_code": signal.device_code,
-                "device_name": signal.device_name,
-                "measure_name": signal.measure_name,
-                "unit": signal.unit,
-                "source_id": signal.source_id,
-                "source_code": signal.source_code,
-                "start_ts": round(float(ts[0]), 3) if ts.size else None,
-                "first_ts": round(float(ts[0]), 3) if ts.size else None,
-                "last_ts": round(float(ts[-1]), 3) if ts.size else None,
-                "point_count": int(ts.size),
-                "bucket_count": bucket_count,
-                "coverage": round(float(observed.sum()) / bucket_count, 6) if bucket_count else 0.0,
-                "values": [None if math.isnan(v) else round(float(v), 4) for v in bucket_values],
-                "observed": observed.tolist(),
-            }
+    # step 1-3: drift evidence is taken on the raw (uncorrected) timestamps
+    drift_table, drift_by_source, drift_confidence = _estimate_source_drift(filtered)
+    corrections = [
+        {
+            "source_id": item["source_id"],
+            "source_code": item["source_code"],
+            "drift_ms": item["drift_ms"],
+            "correction_ms": item["correction_ms"],
+            "confidence": item["confidence"],
+            "is_anchor": item["is_anchor"],
+        }
+        for item in drift_table
+    ]
+
+    # step 3 (cont.): correct every gateway clock onto the anchor timeline
+    corrected: list[tuple[SignalInput, np.ndarray, np.ndarray]] = []
+    corrected_ts_all: list[np.ndarray] = []
+    for signal in filtered:
+        ts, values = _sort_and_dedupe(signal.points)
+        if ts.size == 0:
+            continue
+        shift_s = drift_by_source.get(signal.source_id, 0.0) / 1000.0
+        ts_corrected = ts - shift_s
+        corrected.append((signal, ts_corrected, values))
+        corrected_ts_all.append(ts_corrected)
+
+    # step 4: one shared, wall-clock-aligned grid for every device / measure
+    earliest = float(min(arr[0] for arr in corrected_ts_all))
+    t0 = math.floor(earliest / grid_s) * grid_s
+
+    # step 5: group by physical channel (device + measure), merge gateway members
+    groups: dict[tuple[str, str], list[tuple[SignalInput, np.ndarray, np.ndarray]]] = {}
+    for signal, ts_corrected, values in corrected:
+        groups.setdefault((signal.device_code, signal.measure_name), []).append(
+            (signal, ts_corrected, values)
         )
 
+    channel_payloads: list[dict] = []
+    overlap_payloads: list[dict] = []
+    total_buckets = 0
+    observed_buckets = 0
+    for key in sorted(groups.keys()):
+        members = sorted(groups[key], key=lambda item: (item[0].source_id, item[0].signal_id))
+        payload, overlap_payload = _build_channel(members, t0, grid_s, agg, drift_by_source)
+        total_buckets += payload["bucket_count"]
+        observed_buckets += int(sum(payload["observed"]))
+        channel_payloads.append(payload)
+        if overlap_payload["overlap_buckets"] > 0:
+            overlap_payloads.append(overlap_payload)
+
     coverage = observed_buckets / total_buckets if total_buckets else 0.0
-    drift, drift_confidence = _estimate_source_drift(filtered)
     failure = None
     failure_detail: dict = {}
     if total_points < 0.1 * total_buckets:
@@ -400,13 +554,6 @@ def align_job(
             "disorder_rate": round(disorder_rate, 4),
         }
 
-    payloads = []
-    for item in signal_payloads:
-        cleaned = dict(item)
-        cleaned.pop("values", None)
-        cleaned.pop("observed", None)
-        payloads.append(cleaned)
-
     return AlignResult(
         grid_s=grid_s,
         t0=round(t0, 3),
@@ -414,29 +561,11 @@ def align_job(
         bucket_count=total_buckets,
         coverage=coverage,
         disorder_rate=disorder_rate,
-        signals=signal_payloads,
-        drift=drift,
+        channels=channel_payloads,
+        drift=drift_table,
         drift_confidence=drift_confidence,
+        corrections=corrections,
+        overlaps=overlap_payloads,
         failure=failure,
         failure_detail=failure_detail,
     )
-
-
-def summarize_signals(result: AlignResult) -> list[dict]:
-    """Small per-signal projection for list/detail API responses."""
-    out = []
-    for signal in result.signals:
-        out.append(
-            {
-                "signal_id": signal["signal_id"],
-                "signal_code": signal["signal_code"],
-                "device_code": signal["device_code"],
-                "measure_name": signal["measure_name"],
-                "unit": signal["unit"],
-                "source_code": signal["source_code"],
-                "bucket_count": signal["bucket_count"],
-                "coverage": signal["coverage"],
-                "point_count": signal["point_count"],
-            }
-        )
-    return out
